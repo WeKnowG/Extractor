@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+import time
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,8 @@ from utils.metric import metric
 import config
 from models import SubJectModel, ObjectModel
 
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 
 class Trainer:
 
@@ -34,21 +37,13 @@ class Trainer:
         bert_vocab_path = config.pretrained_model_path + config.MODEL_PATH_MAP[model] + "/vocab.txt"
 
         lm_config = config.MODEL_CLASSES[model][0].from_pretrained(bert_config_path)
-        self.lm_model = config.MODEL_CLASSES[model][1].from_pretrained(bert_model_path, config=lm_config).to(config.device)
-        self.lm_tokenizer = config.MODEL_CLASSES[model][2](bert_vocab_path)
+        self.lm_model = nn.DataParallel(config.MODEL_CLASSES[model][1].from_pretrained(bert_model_path, config=lm_config)).to(config.device)
+        self.lm_tokenizer = config.MODEL_CLASSES[model][2](bert_vocab_path, do_lower_case=False)
          
         self.train_data = CustomDataset(self.train_data, 
                                         self.lm_tokenizer, 
                                         self.rel2id, 
                                         self.num_rels)
-#         self.dev_data = CustomDataset(self.dev_data, 
-#                                       lm_tokenizer, 
-#                                       self.rel2id, 
-#                                       self.num_rels)
-#         self.test_data = CustomDataset(self.test_data,
-#                                        lm_tokenizer, 
-#                                        self.rel2id, 
-#                                        self.num_rels)
         
         # set data loader
         self.train_batcher = DataLoader(self.train_data, 
@@ -56,53 +51,83 @@ class Trainer:
                                         drop_last=True, 
                                         shuffle=True, 
                                         collate_fn=collate_wrapper)
-#         self.dev_batcher = DataLoader(self.dev_data, 
-#                                       config.batch_size,
-#                                       drop_last=True, 
-#                                       shuffle=False, 
-#                                       collate_fn=collate_wrapper)
-#         self.test_batcher = DataLoader(self.test_data, 
-#                                        config.batch_size, 
-#                                        drop_last=True, 
-#                                        shuffle=False, 
-#                                        collate_fn=collate_wrapper)
         
-        self.subject_model = SubJectModel() 
-        self.object_model = ObjectModel(self.num_rels)
+        self.subject_model = nn.DataParallel(SubJectModel()).to(config.device) 
+        self.object_model = nn.DataParallel(ObjectModel(self.num_rels)).to(config.device)
         
         self.criterion = nn.BCELoss(reduction="none")
         
         self.models_params = list(self.lm_model.parameters()) + list(self.subject_model.parameters()) + list(self.object_model.parameters())
         
         self.optimizer = torch.optim.Adam(self.models_params, lr=config.lr)
-
-    def trainIters(self):
         
-        step = 0
+        self.start_step = None
+        
+        if config.load_weight:
+            print("start loading weight...")
+            
+            state = torch.load(config.model_file_path, map_location= lambda storage, location: storage)
+            self.lm_model.module.load_state_dict(state['lm_model'])
+            self.object_model.module.load_state_dict(state['object_model'])
+            self.subject_model.module.load_state_dict(state['subject_model'])
+            
+            self.start_step = state['step']
+            
+            self.optimizer.load_state_dict(state['optimizer'])
+            if config.use_cuda:
+                for state in self.optimizer.state.values():
+                    for k, v in state.items():
+                        if torch.is_tensor(v):
+                            state[k] = v.cuda()
+            
+        
+    def save_models(self, args, total_loss, step):
+        
+        state = {
+            "step": step,
+            "lm_model": self.lm_model.module.state_dict(),
+            "object_model": self.object_model.module.state_dict(),
+            "subject_model": self.subject_model.module.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "current_loss": total_loss
+        }
+        model_save_path = os.path.join(config.save_weights_path, "%s_model_%d_%d" % (args.model, step, int(time.time())) )
+        torch.save(state, model_save_path)
+        
+        
+
+    def trainIters(self, args):
+        
+        self.lm_model.train()
+        self.subject_model.train()
+        self.object_model.train()
+        
+        if self.start_step:
+            step = self.start_step
+        else:
+            step = 0
+            
         for epoch in range(config.epoches): 
             
             for batch in self.train_batcher:
                 total_loss, sub_entities_loss, obj_entities_loss = self.train_one_batch(batch)
-                print(epoch, total_loss, sub_entities_loss, obj_entities_loss)
+                print("epoch:", epoch, "step: ", step, "total_loss:", total_loss, "sub_entities_loss:", sub_entities_loss, "obj_entities_loss: ", obj_entities_loss)
                 step += 1
-#                 if step % 5 == 0:
-#                     metric(self.lm_model, self.subject_model, self.object_model, self.test_data, self.id2rel, self.lm_tokenizer, output_path="./result.json")
+                if step % 2000 == 0:
                     
-#                     print(batch.sub_heads.cpu().numpy().tolist()[0])
-                    
-#                     print(heads.cpu().detach().numpy().tolist()[0])
-                    
-#                     print(batch.sub_tails.cpu().numpy().tolist()[0])
-#                     print(tails.cpu().detach().numpy().tolist()[0])
-#                     print("-"*20)
-                    
-#                     for i in range(len(batch.sub_heads.cpu().numpy().tolist()[0])):
-#                         if batch.sub_heads.cpu().numpy().tolist()[0][i] == 1:
-#                             print(heads.cpu().detach().numpy().tolist()[0][i])
-#                     for i in range(len(batch.sub_tails.cpu().numpy().tolist()[0])):
-#                         if batch.sub_tails.cpu().numpy().tolist()[0][i] == 1:
-#                             print(tails.cpu().detach().numpy().tolist()[0][i])
-#                     print("-"*20)
+                    with torch.no_grad():
+                        
+                        self.lm_model.eval()
+                        self.subject_model.eval()
+                        self.object_model.eval()
+
+                        precision, recall, f1 = metric(self.lm_model, self.subject_model, self.object_model, self.test_data, self.id2rel, self.lm_tokenizer, output_path="./result.json")
+                        print("precision: ", precision, "recall: ", recall, "f1: ", f1)
+                        self.save_models(args, total_loss, step)
+                        
+                    self.lm_model.train()
+                    self.subject_model.train()
+                    self.object_model.train()
             
             self.reset_train_dataloader()
     
@@ -147,9 +172,17 @@ class Trainer:
         obj_heads_loss = self.criterion(pred_obj_heads, obj_heads_batch)
         obj_tails_loss = self.criterion(pred_obj_tails, obj_tails_batch)
         
-        sub_entities_loss = ((sub_heads_loss + sub_tails_loss) * attention_mask_batch).sum() / attention_mask_batch.sum()
+        if config.focal_loss:
         
-        obj_entities_loss = ((obj_heads_loss + obj_tails_loss) * attention_mask_batch.unsqueeze(-1)).sum() / attention_mask_batch.unsqueeze(-1).sum()
+            sub_entities_loss = ((torch.abs(sub_heads_batch - sub_heads) * sub_heads_loss + 
+                                  torch.abs(sub_tails_batch - sub_tails) * sub_tails_loss) * attention_mask_batch).sum() / attention_mask_batch.sum()
+
+            obj_entities_loss = ((torch.abs(obj_heads_batch - pred_obj_heads) * obj_heads_loss + 
+                                  torch.abs(obj_tails_batch - pred_obj_tails) * obj_tails_loss) * attention_mask_batch.unsqueeze(-1)).sum() / attention_mask_batch.unsqueeze(-1).sum()
+        else:
+            sub_entities_loss = ((sub_heads_loss + sub_tails_loss) * attention_mask_batch).sum() / attention_mask_batch.sum()
+        
+            obj_entities_loss = ((obj_heads_loss + obj_tails_loss) * attention_mask_batch.unsqueeze(-1)).sum() / attention_mask_batch.unsqueeze(-1).sum()
         
         
         total_loss = sub_entities_loss + obj_entities_loss
@@ -160,10 +193,6 @@ class Trainer:
         
         return total_loss.item(), sub_entities_loss.item(), obj_entities_loss.item()
            
-        
-        
-        
-        
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Train scrip")
@@ -172,4 +201,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     trainer = Trainer(args.dataset)
     trainer.setup(args.model)
-    trainer.trainIters()
+    trainer.trainIters(args)
